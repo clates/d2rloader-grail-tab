@@ -24,6 +24,7 @@
 
 #include <windows.h>
 
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -36,7 +37,7 @@ static constexpr D2RL::PluginInfo Info {
 	.abiVersion  = D2RL_PLUGIN_ABI_VERSION,
 	.id          = "grail-tab",
 	.name        = "Grail Tab",
-	.version     = "1.0.0",
+	.version     = "1.0.1",
 	.author      = "Lates",
 	.description = "Shared stash tabs with a home slot for every unique and set item.",
 	.flags       = D2RL::PluginFlags::Client,
@@ -78,6 +79,8 @@ static const D2RL::OverlayService*   g_overlay;
 static const D2RL::ThreadService*    g_threads;
 static const D2RL::ItemService*      g_items;
 static const D2RL::InventoryService* g_inventory;
+static const D2RL::DataTableService* g_tables;   // optional: only grail-tables uses it
+static const D2RL::LocalizationService* g_strings;   // optional: display names in grail-tables
 
 // ---------------------------------------------------------------- settings
 
@@ -530,9 +533,20 @@ static void JumpTo(int tab) noexcept {
 	Debug(line);
 }
 
+// D2R keeps its panels inside a centred area at most 19:9 wide, so on wider
+// screens the panel anchors move in from the edges by (width - height * 19/9) / 2.
+// Measured at 1920x800 (115 px) and 3440x1440 (200 px); 16:9 is unaffected.
+// Screens narrower than 16:9 (16:10, 4:3) scale differently and aren't handled yet.
+static constexpr float MaxUiAspect = 19.0f / 9.0f;
+
+static auto UiOriginX() noexcept -> float {   // left edge of D2R's panel area, in screen pixels
+	return (g_screenW - std::fmin(g_screenW, g_screenH * MaxUiAspect)) / 2;
+}
+
+// Screen pixels per layout unit, and the stash panel's position in layout units.
 static void ScreenMap(float* k, float* panelX, float* panelY) noexcept {
 	*k      = g_screenH / ReferenceHeight;
-	*panelX = PanelAnchorX * (g_screenW / *k) + g_view.panel.x;
+	*panelX = (UiOriginX() + PanelAnchorX * (g_screenW - 2 * UiOriginX())) / *k + g_view.panel.x;
 	*panelY = PanelAnchorY * ReferenceHeight + g_view.panel.y;
 }
 
@@ -1340,6 +1354,254 @@ static auto __cdecl StatusCommand(D2R::Game::Client*, const D2RL::ConsoleCommand
 		g_view.stashOpen ? "open" : "closed", Tops[static_cast<int>(g_view.top)], g_view.tab + 1, g_view.filledCount,
 		sizeof Slots / sizeof Slots[0], g_view.misplacedCount);
 	command->plugin->WriteConsoleMessage(line);
+	// Where the overlay draws the grid, for alignment reports.
+	float k, px, py;
+	ScreenMap(&k, &px, &py);
+	std::snprintf(line, sizeof line, "Screen %.0fx%.0f, panel area from x %.0f. Grid drawn at x %.0f, y %.0f, width %.0f.", g_screenW, g_screenH,
+		UiOriginX(), (px + g_view.grid.x) * k, (py + g_view.grid.y) * k, g_view.grid.width * k);
+	command->plugin->WriteConsoleMessage(line);
+	return D2RL::ConsoleCommandResult::Handled;
+}
+
+// ---------------------------------------------------------------- grail-tables (diagnostics for modded tables)
+//
+// Writes d2rloader/logs/grail-tab-tables.txt: the item tables the game actually
+// loaded, so modded setups can be supported without having the mod. For each
+// bank: row counts and sizes. Then every built-in slot checked against the
+// loaded row it points at (a mod that inserts or reorders rows shows up here),
+// and every UniqueItems, SetItems, Sets, Items and ItemTypes row as its printable
+// strings (index names and 4-letter item codes are stored as text) plus raw hex,
+// since the compiled row layouts aren't documented. Before the raw rows comes a
+// decoded list of unique and set items, using the offsets below (worked out from
+// an unmodded 3.3.94995 dump with tools/decode_dump.py); it's skipped if a row
+// size differs, which means the layout changed.
+
+static wchar_t g_tablesPath[MAX_PATH];
+static char    g_tablesResult[MAX_PATH + 96];
+
+static constexpr struct { D2RL::DataTables::TableId id; const char* name; } DumpedTables[] = {
+	{ D2RL::DataTables::TableId::UniqueItems, "UniqueItems" },
+	{ D2RL::DataTables::TableId::SetItems, "SetItems" },
+	{ D2RL::DataTables::TableId::Sets, "Sets" },
+	{ D2RL::DataTables::TableId::Items, "Items" },
+	{ D2RL::DataTables::TableId::ItemTypes, "ItemTypes" },
+};
+
+// Compiled row layouts (3.3.94995). Offsets are bytes into a row.
+namespace RowLayout {
+inline constexpr uint32_t UniqueSize = 348, SetItemSize = 460, SetSize = 352, ItemSize = 448;
+inline constexpr uint32_t IndexName = 0x02;               // UniqueItems/SetItems: char[32] internal name
+inline constexpr uint32_t UniqueNameId = 0x22;            // u16 string id of the display name
+inline constexpr uint32_t SetItemNameId = 0x24;
+inline constexpr uint32_t BaseCode = 0x28;                // 4-character base item code
+inline constexpr uint32_t Flags = 0x2c;                   // bit 0: spawnable, bit 3: disableChronicle
+inline constexpr uint32_t SetItemSet = 0x30;              // u16 row in Sets
+inline constexpr uint32_t UniqueRarity = 0x34, UniqueLevel = 0x38, UniqueReqLevel = 0x3a;   // u16
+inline constexpr uint32_t SetItemLevel = 0x34, SetItemReqLevel = 0x36, SetItemRarity = 0x38;  // u16
+inline constexpr uint32_t SetNameId = 0x02;               // Sets: u16 string id
+inline constexpr uint32_t ItemCode = 0x80, ItemNameId = 0xfc, ItemInvWidth = 0x11e, ItemInvHeight = 0x11f, ItemType = 0x12e;
+}
+
+template <typename T>
+static auto At(const void* row, uint32_t offset) noexcept -> T {
+	T value;
+	std::memcpy(&value, static_cast<const uint8_t*>(row) + offset, sizeof value);
+	return value;
+}
+
+static void StringById(uint32_t id, char* out, uint32_t size) noexcept {
+	out[0] = 0;
+	if (g_strings == nullptr || g_strings->getStringById(g_ctx, id, out, size, nullptr) != D2RL::Localization::Result::Success) {
+		std::snprintf(out, size, "#%u", id);
+	}
+	for (char* c = out; *c; ++c) {
+		if (*c == '\t' || *c == '\n' || *c == '\r') {
+			*c = ' ';
+		}
+	}
+}
+
+// One line per unique and set item: kind, row, internal name, display name, base code,
+// base name, base size, base item type row, rarity, qlvl, required level, spawnable, set.
+static void DumpDecoded(FILE* f) noexcept {
+	using namespace D2RL::DataTables;
+	TableView uniques { .structSize = TableViewSize }, setItems { .structSize = TableViewSize };
+	TableView sets { .structSize = TableViewSize }, items { .structSize = TableViewSize };
+	if (g_tables->getTable(g_ctx, Bank::Rotw, TableId::UniqueItems, &uniques) != Result::Success
+		|| g_tables->getTable(g_ctx, Bank::Rotw, TableId::SetItems, &setItems) != Result::Success
+		|| g_tables->getTable(g_ctx, Bank::Rotw, TableId::Sets, &sets) != Result::Success
+		|| g_tables->getTable(g_ctx, Bank::Rotw, TableId::Items, &items) != Result::Success) {
+		std::fprintf(f, "\n== Decoded items: skipped, a table is unavailable ==\n");
+		return;
+	}
+	if (uniques.rowSize != RowLayout::UniqueSize || setItems.rowSize != RowLayout::SetItemSize || sets.rowSize != RowLayout::SetSize
+		|| items.rowSize != RowLayout::ItemSize) {
+		std::fprintf(f, "\n== Decoded items: skipped, row sizes differ from 3.3.94995 (the layout changed) ==\n");
+		return;
+	}
+	std::fprintf(f, "\n== Decoded items (RotW) ==\nkind\trow\tindex\tname\tbase\tbase name\tsize\ttype row\trarity\tqlvl\treq level\tspawnable\tset\n");
+	const auto base = [&](const void* row, char* name, uint32_t nameSize, int* w, int* h, int* type) {
+		const uint32_t code = At<uint32_t>(row, RowLayout::BaseCode);
+		RowView item { .structSize = RowViewSize };
+		*w = *h = *type = -1;
+		std::snprintf(name, nameSize, "?");
+		if (g_tables->findRowByCode(g_ctx, Bank::Rotw, TableId::Items, code, &item) == Result::Success && item.row != nullptr) {
+			StringById(At<uint16_t>(item.row, RowLayout::ItemNameId), name, nameSize);
+			*w    = At<uint8_t>(item.row, RowLayout::ItemInvWidth);
+			*h    = At<uint8_t>(item.row, RowLayout::ItemInvHeight);
+			*type = At<uint16_t>(item.row, RowLayout::ItemType);
+		}
+	};
+	for (int kind = 0; kind < 2; ++kind) {
+		const TableView& t = kind == 0 ? uniques : setItems;
+		for (uint32_t i = 0; i < t.rowCount; ++i) {
+			const void* row = static_cast<const uint8_t*>(t.rows) + static_cast<size_t>(i) * t.rowSize;
+			char index[33] = {}, name[128], baseName[128], setName[128] = "";
+			std::memcpy(index, static_cast<const uint8_t*>(row) + RowLayout::IndexName, 32);
+			StringById(At<uint16_t>(row, kind == 0 ? RowLayout::UniqueNameId : RowLayout::SetItemNameId), name, sizeof name);
+			int w, h, type;
+			base(row, baseName, sizeof baseName, &w, &h, &type);
+			const uint32_t code = At<uint32_t>(row, RowLayout::BaseCode);
+			if (kind == 1) {
+				const uint16_t set = At<uint16_t>(row, RowLayout::SetItemSet);
+				if (set < sets.rowCount) {
+					StringById(At<uint16_t>(static_cast<const uint8_t*>(sets.rows) + static_cast<size_t>(set) * sets.rowSize, RowLayout::SetNameId), setName, sizeof setName);
+				}
+			}
+			std::fprintf(f, "%s\t%u\t%s\t%s\t%.4s\t%s\t%dx%d\t%d\t%u\t%u\t%u\t%u\t%s\n", kind == 0 ? "unique" : "set", i, index, name,
+				reinterpret_cast<const char*>(&code), baseName, w, h, type,
+				At<uint16_t>(row, kind == 0 ? RowLayout::UniqueRarity : RowLayout::SetItemRarity),
+				At<uint16_t>(row, kind == 0 ? RowLayout::UniqueLevel : RowLayout::SetItemLevel),
+				At<uint16_t>(row, kind == 0 ? RowLayout::UniqueReqLevel : RowLayout::SetItemReqLevel),
+				At<uint8_t>(row, RowLayout::Flags) & 1u, setName);
+		}
+	}
+}
+
+// Runs of 3+ printable characters, joined with " | ". Returns the length written.
+static auto RowStrings(const uint8_t* row, uint32_t size, char* out, size_t outSize) noexcept -> size_t {
+	size_t n = 0;
+	out[0] = 0;
+	for (uint32_t i = 0; i < size;) {
+		uint32_t j = i;
+		while (j < size && row[j] >= 0x20 && row[j] < 0x7F) {
+			++j;
+		}
+		if (j - i >= 3 && n + (j - i) + 4 < outSize) {
+			n += std::snprintf(out + n, outSize - n, "%s%.*s", n ? " | " : "", static_cast<int>(j - i), reinterpret_cast<const char*>(row + i));
+		}
+		i = j + 1;
+	}
+	return n;
+}
+
+// Lowercase letters and digits only, so an index name is found inside a row's strings
+// regardless of the spaces and punctuation around it.
+static void Squash(const char* in, char* out, size_t outSize) noexcept {
+	size_t n = 0;
+	for (; *in && n + 1 < outSize; ++in) {
+		const char c = *in;
+		if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) {
+			out[n++] = c;
+		} else if (c >= 'A' && c <= 'Z') {
+			out[n++] = static_cast<char>(c - 'A' + 'a');
+		}
+	}
+	out[n] = 0;
+}
+
+static void __cdecl ReportTables(const D2RL::PluginContext*, void*) noexcept {
+	g_ctx->WriteConsoleMessage(g_tablesResult);
+}
+
+static void __cdecl DumpTables(const D2RL::PluginContext*, void*) noexcept {
+	using namespace D2RL::DataTables;
+	FILE* f = _wfopen(g_tablesPath, L"w");
+	if (f == nullptr) {
+		std::snprintf(g_tablesResult, sizeof g_tablesResult, "grail-tables: couldn't write d2rloader/logs/grail-tab-tables.txt.");
+		g_threads->runOnUiThread(g_ctx, ReportTables, nullptr);
+		return;
+	}
+	std::fprintf(f, "Grail Tab %s table dump. Built-in slots: %zu (from the unmodded tables).\n\n", Info.version, sizeof Slots / sizeof Slots[0]);
+
+	static constexpr struct { Bank bank; const char* name; } Banks[] = { { Bank::Rotw, "RotW" }, { Bank::Lod, "LoD" }, { Bank::Classic, "Classic" } };
+	for (const auto& b : Banks) {
+		std::fprintf(f, "[%s]", b.name);
+		for (const auto& t : DumpedTables) {
+			TableView view { .structSize = TableViewSize };
+			const Result r = g_tables->getTable(g_ctx, b.bank, t.id, &view);
+			if (r == Result::Success) {
+				std::fprintf(f, " %s: %u rows of %u bytes;", t.name, view.rowCount, view.rowSize);
+			} else {
+				std::fprintf(f, " %s: result %u;", t.name, static_cast<unsigned>(r));
+			}
+		}
+		std::fprintf(f, "\n");
+	}
+
+	// Built-in slots against the rows they point at (RotW bank).
+	int matched = 0, mismatched = 0;
+	std::fprintf(f, "\n== Built-in slots whose row doesn't hold the expected item (RotW) ==\n");
+	for (const Slot& slot : Slots) {
+		RowView row { .structSize = RowViewSize };
+		const TableId id = slot.kind == 0 ? TableId::UniqueItems : TableId::SetItems;
+		char strings[1024] = "(no row)", want[96], have[1024];
+		bool ok = false;
+		if (g_tables->getRow(g_ctx, Bank::Rotw, id, slot.row, &row) == Result::Success && row.row != nullptr) {
+			RowStrings(static_cast<const uint8_t*>(row.row), row.rowSize, strings, sizeof strings);
+			Squash(slot.key, want, sizeof want);
+			Squash(strings, have, sizeof have);
+			ok = want[0] && std::strstr(have, want) != nullptr;
+		}
+		ok ? ++matched : ++mismatched;
+		if (!ok) {
+			std::fprintf(f, "%s row %u: expected \"%s\" (%s), row has: %s\n", slot.kind == 0 ? "unique" : "set", slot.row, slot.key, slot.name, strings);
+		}
+	}
+	std::fprintf(f, "%d of %zu slots match their row, %d don't.\n", matched, sizeof Slots / sizeof Slots[0], mismatched);
+	DumpDecoded(f);
+
+	// Every row, RotW bank.
+	for (const auto& t : DumpedTables) {
+		TableView view { .structSize = TableViewSize };
+		if (g_tables->getTable(g_ctx, Bank::Rotw, t.id, &view) != Result::Success || view.rows == nullptr) {
+			continue;
+		}
+		std::fprintf(f, "\n== %s (RotW): %u rows of %u bytes. row | strings | hex ==\n", t.name, view.rowCount, view.rowSize);
+		const auto* rows = static_cast<const uint8_t*>(view.rows);
+		for (uint32_t i = 0; i < view.rowCount; ++i) {
+			const uint8_t* row = rows + static_cast<size_t>(i) * view.rowSize;
+			char strings[1024];
+			RowStrings(row, view.rowSize, strings, sizeof strings);
+			std::fprintf(f, "%u | %s | ", i, strings);
+			static constexpr char Hex[] = "0123456789abcdef";
+			char hex[4096 * 2 + 2];
+			const uint32_t bytes = view.rowSize < 4096 ? view.rowSize : 4096;
+			for (uint32_t b = 0; b < bytes; ++b) {
+				hex[b * 2]     = Hex[row[b] >> 4];
+				hex[b * 2 + 1] = Hex[row[b] & 15];
+			}
+			hex[bytes * 2]     = '\n';
+			hex[bytes * 2 + 1] = 0;
+			std::fputs(hex, f);
+		}
+	}
+	std::fclose(f);
+	std::snprintf(g_tablesResult, sizeof g_tablesResult, "grail-tables: %d of %zu slots match the loaded tables. Wrote d2rloader/logs/grail-tab-tables.txt.",
+		matched, sizeof Slots / sizeof Slots[0]);
+	g_threads->runOnUiThread(g_ctx, ReportTables, nullptr);
+}
+
+static auto __cdecl TablesCommand(D2R::Game::Client*, const D2RL::ConsoleCommandContext* command, void*) noexcept -> D2RL::ConsoleCommandResult {
+	if (g_tables == nullptr || g_threads == nullptr || g_tablesPath[0] == 0) {
+		command->plugin->WriteConsoleMessage("grail-tables: this loader doesn't offer the data table service.");
+		return D2RL::ConsoleCommandResult::Failed;
+	}
+	if (g_threads->runOnGameThread(g_ctx, DumpTables, nullptr) != D2RL::Threads::Result::Success) {
+		command->plugin->WriteConsoleMessage("grail-tables: run this while you're in a single-player game.");
+		return D2RL::ConsoleCommandResult::Failed;
+	}
+	command->plugin->WriteConsoleMessage("grail-tables: writing the table dump...");
 	return D2RL::ConsoleCommandResult::Handled;
 }
 
@@ -1379,7 +1641,8 @@ D2RL_PLUGIN_EXPORT auto D2RLoaderLoadPlugin(const D2RL::PluginContext* context) 
 	g_ctx = context;
 
 	if (!context->RegisterConsoleCommand("grail-status", StatusCommand, "Show Grail Tab's setup and state.")
-		|| !context->RegisterConsoleCommand("grail-debug", DebugCommand, "Toggle Grail Tab's debug log.")) {
+		|| !context->RegisterConsoleCommand("grail-debug", DebugCommand, "Toggle Grail Tab's debug log.")
+		|| !context->RegisterConsoleCommand("grail-tables", TablesCommand, "Write the loaded item tables to d2rloader/logs/grail-tab-tables.txt (for modded setups).")) {
 		Note("FAILED: console commands");
 	}
 
@@ -1395,6 +1658,12 @@ D2RL_PLUGIN_EXPORT auto D2RLoaderLoadPlugin(const D2RL::PluginContext* context) 
 	ok &= Query("item clicks", &interactions, D2RL::ItemInteractionServiceRequiredSize);
 	ok &= Query("ui events", &events, D2RL::SharedEventServiceRequiredSize);
 	ok &= Query("input", &input, D2RL::InputServiceRequiredSize);
+	if (!Query("data tables", &g_tables, D2RL::DataTableServiceRequiredSize)) {
+		g_tables = nullptr;   // optional
+	}
+	if (!Query("localization", &g_strings, D2RL::LocalizationServiceRequiredSize)) {
+		g_strings = nullptr;   // optional
+	}
 	if (!D2RL::HasItemServiceCapability(g_items, D2RL::Items::ItemServiceCapability::SharedStashWrite)) {
 		Note("Shared stash writes aren't available: Ctrl+click filing is off.");
 		g_cfg.ctrlClick = false;
@@ -1409,6 +1678,7 @@ D2RL_PLUGIN_EXPORT auto D2RLoaderLoadPlugin(const D2RL::PluginContext* context) 
 	if (wchar_t* slash = n ? std::wcsrchr(exe, L'\\') : nullptr) {
 		*slash = 0;
 		std::swprintf(g_loaderToml, MAX_PATH, L"%ls\\d2rloader\\config\\d2rloader.toml", exe);
+		std::swprintf(g_tablesPath, MAX_PATH, L"%ls\\d2rloader\\logs\\grail-tab-tables.txt", exe);
 	}
 	g_liveAddedTabs = ReadAddedTabs();
 	LoadSettings();

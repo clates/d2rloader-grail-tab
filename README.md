@@ -95,6 +95,17 @@ stash when that happens: raise `add_shared_tabs` back to the number it gives and
 - **The `grail-status` console command** shows setup, tab counts and what the plugin can see.
 - **The `grail-debug` console command** logs clicks, page tracking and item moves to the
   console and the log.
+- **Labels don't line up with the grid.** Ultrawide screens (wider than 19:9, such as
+  3440x1440) are handled since 1.0.1. Screens narrower than 16:9 (16:10 like 1920x1200 or the
+  Steam Deck, and 4:3) aren't yet. Run `grail-status` with the stash open and include its last
+  line and a screenshot in a bug report: it shows the screen size and where Grail Tab draws the
+  grid.
+- **Mods that change the unique or set item tables.** Grail Tab's slots come from the unmodded
+  tables. Items a mod adds at the end of those tables have no slot; a mod that inserts or
+  reorders rows can make it label and file the wrong items. Support for modded tables is
+  planned. To help, run `grail-tables` while in a game: it writes
+  `d2rloader/logs/grail-tab-tables.txt` with the tables your game loaded and which built-in
+  slots no longer match. Attach that file to an issue, with the name of your mod.
 
 ## How it works
 
