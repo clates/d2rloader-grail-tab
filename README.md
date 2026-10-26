@@ -93,6 +93,8 @@ stash when that happens: raise `add_shared_tabs` back to the number it gives and
   game update they may not match. Check `d2rloader/logs/grail-tab.log` for
   `Overlay clip fix: off`; if it's there, Grail Tab needs an update for that game version.
 - **The `grail-status` console command** shows setup, tab counts and what the plugin can see.
+  It also writes them to `d2rloader/logs/grail-tab.log`, which is cleared each time the game
+  starts: attach that file to a bug report before relaunching.
 - **The `grail-debug` console command** logs clicks, page tracking and item moves to the
   console and the log.
 - **Labels don't line up with the grid.** Ultrawide screens (wider than 19:9, such as

@@ -37,7 +37,7 @@ static constexpr D2RL::PluginInfo Info {
 	.abiVersion  = D2RL_PLUGIN_ABI_VERSION,
 	.id          = "grail-tab",
 	.name        = "Grail Tab",
-	.version     = "1.0.1",
+	.version     = "1.0.2",
 	.author      = "Lates",
 	.description = "Shared stash tabs with a home slot for every unique and set item.",
 	.flags       = D2RL::PluginFlags::Client,
@@ -46,6 +46,7 @@ static constexpr D2RL::PluginInfo Info {
 static constexpr int   VanillaSharedTabs = 5;      // the stash paginator: 105 tabs with add_shared_tabs = 100
 static constexpr float ReferenceHeight   = 2160;   // HD layout units per screen height
 static constexpr float PanelAnchorX = 0.0f, PanelAnchorY = 0.397f;   // _profilehd.json $LeftPanelAnchor
+static constexpr float ItemCellSize = 98;   // _profilehd.json $ItemCellSize, layout units per inventory cell
 static constexpr int   TabBarX = 82, TabBarY = 146, TabWidth = 195, TabCount = 5, SharedTabIndex = 1;
 static constexpr ULONGLONG RefreshMs = 250, ToastMs = 3000;
 
@@ -1181,7 +1182,10 @@ static void DrawFrame(const D2RL::Overlay::Frame* frame) noexcept {
 	float k, px, py;
 	ScreenMap(&k, &px, &py);
 	const float gx = (px + view.grid.x) * k, gy = (py + view.grid.y) * k;
-	const float cell = view.grid.width / static_cast<float>(GridWidth) * k;
+	// One inventory cell ($ItemCellSize in _profileHD.json), not the grid's width / 10:
+	// expanded-stash mods make the grid bigger than 10x10 but keep the cell size.
+	// Grail pages use its top-left 10x10; anything spanning the grid uses its real size.
+	const float cell = ItemCellSize * k;
 	// The overlay font is a pixel font: whole multiples of its native size stay sharp.
 	const float base = frame->defaultTextSize > 0 ? frame->defaultTextSize : 13.0f;
 	const float size = base * (cell >= 5 * base ? static_cast<float>(static_cast<int>(cell / (5 * base))) : 1.0f);
@@ -1194,15 +1198,15 @@ static void DrawFrame(const D2RL::Overlay::Frame* frame) noexcept {
 	if (view.toastUntil > GetTickCount64() && view.toast[0]) {   // over the grid, or the screen when the stash is closed
 		const int len = static_cast<int>(std::strlen(view.toast));
 		const float tw = Measure(canvas, view.toast, len, size);
-		const float tx = view.stashOpen ? gx + (GridWidth * cell - tw) / 2 : (g_screenW - tw) / 2;
-		const float ty = view.stashOpen ? gy + GridHeight * cell / 2 - size : g_screenH * 0.3f;
+		const float tx = view.stashOpen ? gx + (view.grid.width * k - tw) / 2 : (g_screenW - tw) / 2;
+		const float ty = view.stashOpen ? gy + view.grid.height * k / 2 - size : g_screenH * 0.3f;
 		Fill(canvas, tx - 12, ty - 8, tx + tw + 12, ty + size + 10, { 0, 0, 0, 0.85f });
 		Text(canvas, tx, ty, view.toast, len, size, ToastWhite);
 	}
 }
 
 static void DrawStash(D2RL::Overlay::CanvasHandle canvas, const View& view, float gx, float gy, float cell, float size) noexcept {
-	const float gridBottom = gy + GridHeight * cell;
+	const float gridW = view.grid.width * cell / ItemCellSize, gridBottom = gy + view.grid.height * cell / ItemCellSize;
 	DrawButton(canvas, view);
 	if (view.banner) {
 		static constexpr char Banner[] = "Grail Tab: click the chalice to add its shared tabs (then quit and relaunch the game).";
@@ -1265,7 +1269,7 @@ static void DrawStash(D2RL::Overlay::CanvasHandle canvas, const View& view, floa
 	int len = std::snprintf(line, sizeof line, "Grail %d/%d", page + 1, BlockPages());
 	{
 		const float tw = Measure(canvas, line, len, size);
-		const float cx = gx + GridWidth * cell / 2, cy = gridBottom + 114 * cell / 98 - 1;
+		const float cx = gx + gridW / 2, cy = gridBottom + 114 * cell / 98 - 1;
 		const float l = static_cast<float>(static_cast<int>(cx - tw / 2 - 8)), r = static_cast<float>(static_cast<int>(cx + tw / 2 + 8));
 		const float t = static_cast<float>(static_cast<int>(cy - size / 2 - 4)), b = static_cast<float>(static_cast<int>(cy + size / 2 + 4));
 		Fill(canvas, l, t, r, b, { 0.05f, 0.04f, 0.03f, 0.95f });
@@ -1287,7 +1291,7 @@ static void DrawStash(D2RL::Overlay::CanvasHandle canvas, const View& view, floa
 	}
 	const char* name = std::strstr(title, ": ") ? std::strstr(title, ": ") + 2 : title;
 	len = std::snprintf(line, sizeof line, "%d/%d", sectionFilled, sectionSlots);
-	const float left = gx + 700 * cell / 98 + size, right = gx + GridWidth * cell;
+	const float left = gx + 700 * cell / 98 + size, right = gx + gridW;
 	// Counts sit right-aligned in a column wide enough for "000/000"; the section name
 	// and the word "Grail" both end at its left edge, one space short.
 	const float countColumn = Measure(canvas, "000/000", 7, size), labelRight = right - countColumn - Measure(canvas, " ", 1, size);
@@ -1348,18 +1352,20 @@ static auto __cdecl StatusCommand(D2R::Game::Client*, const D2RL::ConsoleCommand
 	static constexpr const char* Tops[]   = { "unknown", "shared", "other" };
 	char line[320];
 	std::snprintf(line, sizeof line,
-		"Setup: %s. Shared tabs: %d (add_shared_tabs %d). Grail block: tabs %d-%d (%d pages).\n"
+		"Setup: %s. Shared tabs: %d (add_shared_tabs %d). Grail block: tabs %d-%d (%d pages). "
 		"Stash %s, top tab %s, shared tab %d. Filed %d/%zu, misplaced %d.",
 		States[static_cast<int>(SetupState())], TotalTabs(), g_liveAddedTabs, g_cfg.firstTab, g_cfg.firstTab + BlockPages() - 1, BlockPages(),
 		g_view.stashOpen ? "open" : "closed", Tops[static_cast<int>(g_view.top)], g_view.tab + 1, g_view.filledCount,
 		sizeof Slots / sizeof Slots[0], g_view.misplacedCount);
 	command->plugin->WriteConsoleMessage(line);
+	g_ctx->LogInfo(line);   // in grail-tab.log too, for bug reports
 	// Where the overlay draws the grid, for alignment reports.
 	float k, px, py;
 	ScreenMap(&k, &px, &py);
 	std::snprintf(line, sizeof line, "Screen %.0fx%.0f, panel area from x %.0f. Grid drawn at x %.0f, y %.0f, width %.0f.", g_screenW, g_screenH,
 		UiOriginX(), (px + g_view.grid.x) * k, (py + g_view.grid.y) * k, g_view.grid.width * k);
 	command->plugin->WriteConsoleMessage(line);
+	g_ctx->LogInfo(line);   // in grail-tab.log too, for bug reports
 	return D2RL::ConsoleCommandResult::Handled;
 }
 
